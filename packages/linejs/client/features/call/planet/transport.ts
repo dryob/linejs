@@ -18,6 +18,7 @@ import { Buffer } from "node:buffer";
 import type { Socket as DgramSocket } from "node:dgram";
 import type * as LINETypes from "@evex/linejs-types";
 import type { CallTransport } from "../session.ts";
+import type { IncomingAudioCall, IncomingCallRoute } from "../incoming.ts";
 import { makeChunkHdr, parseFrameHeader } from "./framing.ts";
 import {
 	aesCtrDecrypt,
@@ -42,13 +43,16 @@ import {
 import {
 	CC_MSG,
 	type CcConnReq,
+	type CcConnRsp,
 	type CcParticipateReq,
 	type CcSetupReq,
 	decodeCcConnReq,
+	decodeCcConnRsp,
 	decodeCcInfoReq,
 	decodeCcParticipateRsp,
 	decodeCcRelReq,
 	decodeCcSetupRsp,
+	decodeCcVerifyRsp,
 	type DecodedField,
 	type DecodedPlanetMsgHdr,
 	decodeFields,
@@ -61,12 +65,14 @@ import {
 	MC_MSG,
 	type NativeSetupOffer,
 	packBepiChannelOpen,
+	packCcConnReq,
 	packCcConnRsp,
 	packCcInfoReq,
 	packCcInfoRsp,
 	packCcParticipateReq,
 	packCcRelReq,
 	packCcSetupReq,
+	packCcVerifyReq,
 	packKeepaliveReq,
 	packMcChangeRsp,
 	packMcCheckRpt,
@@ -74,6 +80,7 @@ import {
 	packMcDataRsp,
 	packMcDataSessionPayload,
 	packMcJoinRsp,
+	packNativeAnswer,
 	packNativeGroupParticipateOffer,
 	packNativeSetupOffer,
 	packPlanetCcMsg,
@@ -182,6 +189,7 @@ export interface PlanetInviteResult {
 
 export interface PlanetIncomingMessage {
 	plaintext: Uint8Array;
+	source?: { host: string; port: number };
 	message?: ReturnType<typeof decodePlanetMsg>;
 }
 
@@ -207,6 +215,23 @@ export interface PlanetLocalMediaOffer {
 	keypair: EphemeralKeypair;
 	material: PlanetSetupOfferMaterial;
 	offer: Uint8Array;
+}
+
+/** Application-owned installation identity; persist deviceId outside the library. */
+export interface PlanetIncomingIdentity {
+	deviceId: string;
+	userAgent: PlanetUserAgent;
+}
+
+export const AUDIO_SERVICE_KEY = "freecall.audio";
+
+interface IncomingState {
+	phase: "verifying" | "verified" | "answering" | "answered";
+	expected?: PlanetMsgHdr;
+	peer?: NativeSetupOffer;
+	sessionEndpoint?: { host: string; port: number };
+	ua: Uint8Array;
+	signal?: AbortSignal;
 }
 
 interface CallRouteParsed {
@@ -275,7 +300,9 @@ function audioMediaKeyMode(mode: MediaKdfMode): Exclude<
 	return `audio-${mode}` as Exclude<PlanetMediaKeyMode, "auto">;
 }
 
-function parseRoute(r: LINETypes.CallRoute): CallRouteParsed {
+function parseRoute(
+	r: IncomingCallRoute & { stid?: string; stnpk?: string },
+): CallRouteParsed {
 	const commParam = JSON.parse(r.commParam || "{}");
 	const mpkeyB64 = commParam.mpkey;
 	if (!mpkeyB64) throw new Error("CallRoute.commParam.mpkey missing");
@@ -317,7 +344,7 @@ function parseGroupRoute(r: LINETypes.GroupCallRoute): CallRouteParsed {
 }
 
 function isGroupRoute(
-	r: LINETypes.CallRoute | LINETypes.GroupCallRoute,
+	r: IncomingCallRoute | LINETypes.CallRoute | LINETypes.GroupCallRoute,
 ): r is LINETypes.GroupCallRoute {
 	return "token" in r && !("toMid" in r);
 }
@@ -1029,6 +1056,8 @@ export class PlanetTransport implements CallTransport {
 	#ended: Promise<PlanetEndReason>;
 	#closePromise?: Promise<void>;
 	#relRspInFlight = new Set<Promise<void>>();
+	#incoming?: IncomingState;
+	#incomingAbort?: () => void;
 
 	constructor(opts: PlanetTransportOpts) {
 		this.#opts = opts;
@@ -1079,8 +1108,13 @@ export class PlanetTransport implements CallTransport {
 	}
 
 	async connect(
-		opts: { route: LINETypes.CallRoute | LINETypes.GroupCallRoute },
+		opts: {
+			route: IncomingCallRoute | LINETypes.CallRoute | LINETypes.GroupCallRoute;
+		},
 	): Promise<void> {
+		this.#incoming = undefined;
+		this.#rmtNonce = 0n;
+		this.#nonceLearned = false;
 		this.#route = isGroupRoute(opts.route)
 			? parseGroupRoute(opts.route)
 			: parseRoute(opts.route);
@@ -1155,12 +1189,35 @@ export class PlanetTransport implements CallTransport {
 			const isIPv6 = !!this.#opts.preferIpv6 && !!this.#route.cscfHost6;
 			const sock = dgram.createSocket(isIPv6 ? "udp6" : "udp4");
 			this.#sock = sock;
-			await new Promise<void>((res) =>
-				sock.bind(
-					{ address: isIPv6 ? "::" : "0.0.0.0", port: 0 },
-					() => res(),
-				)
-			);
+			await new Promise<void>((resolve, reject) => {
+				const fail = (error: Error) => {
+					clearTimeout(timer);
+					try {
+						sock.close();
+					} catch (closeError) {
+						if (
+							(closeError as NodeJS.ErrnoException).code !==
+								"ERR_SOCKET_DGRAM_NOT_RUNNING"
+						) {
+							reject(closeError);
+							return;
+						}
+					}
+					if (this.#sock === sock) this.#sock = undefined;
+					reject(error);
+				};
+				const timer = setTimeout(
+					() => fail(new Error("PLANET socket bind timeout")),
+					this.#opts.timeoutMs ?? 10000,
+				);
+				sock.once("error", fail);
+				sock.bind({ address: isIPv6 ? "::" : "0.0.0.0", port: 0 }, () => {
+					clearTimeout(timer);
+					sock.removeListener("error", fail);
+					sock.on("error", () => this.#end({ by: "local" }));
+					resolve();
+				});
+			});
 			sock.on("message", (buf, rinfo) =>
 				this.#onWire(new Uint8Array(buf), {
 					host: rinfo.address,
@@ -1204,13 +1261,25 @@ export class PlanetTransport implements CallTransport {
 				return;
 			}
 			parseFrameHeader(wire);
+			const previousRecvKeys = this.#recvKeys;
 			const pt = this.#decryptWire(wire);
 			if (!pt) {
 				this.#debug({ type: "decrypt_fail" });
 				return;
 			}
 			this.#debug({ type: "decrypt_ok", plainBytes: pt.length });
-			const incoming: PlanetIncomingMessage = { plaintext: pt };
+			const incoming: PlanetIncomingMessage = { plaintext: pt, source };
+			// Authenticate and correlate before mutating session state or auto-replying.
+			if (this.#incoming) {
+				let correlated = false;
+				try {
+					correlated = this.#matchesIncoming(decodePlanetMsg(pt));
+				} catch { /* malformed */ }
+				if (!correlated) {
+					this.#recvKeys = previousRecvKeys;
+					return;
+				}
+			}
 			let outer: DecodedField[];
 			try {
 				outer = decodeFields(pt);
@@ -1398,7 +1467,7 @@ export class PlanetTransport implements CallTransport {
 		if (this.#rtp.host === source.host && this.#rtp.port === source.port) {
 			return;
 		}
-		if (this.#groupJoined) {
+		if (this.#groupJoined || this.#incoming) {
 			this.#debug({
 				type: "media_endpoint_learn_skipped",
 				reason: "group_fixed_route",
@@ -1604,6 +1673,9 @@ export class PlanetTransport implements CallTransport {
 		const hdr = "replyTo" in opts
 			? this.#planetReplyHdr(opts.msgId ?? this.#msgIdCounter++, opts.replyTo)
 			: this.#planetHdr(opts.msgId);
+		if (this.#incoming && (opts.msgId === 0x2142 || opts.msgId === 0x2144)) {
+			this.#incoming.expected = hdr;
+		}
 		const planetMsg = packPlanetMsg(hdr, body);
 		this.#debug({
 			type: "send_planet_msg",
@@ -1698,15 +1770,17 @@ export class PlanetTransport implements CallTransport {
 		const queued = this.#queued.shift();
 		if (queued) return Promise.resolve(queued);
 		return new Promise((res, rj) => {
-			const t = setTimeout(
-				() => rj(new Error("PLANET reply timeout")),
-				timeoutMs,
-			);
-			this.#pending.push((env) => {
+			const waiter = (env: PlanetIncomingMessage | Error) => {
 				clearTimeout(t);
 				if (env instanceof Error) rj(env);
 				else res(env);
-			});
+			};
+			const t = setTimeout(() => {
+				const index = this.#pending.indexOf(waiter);
+				if (index !== -1) this.#pending.splice(index, 1);
+				rj(new Error("PLANET reply timeout"));
+			}, timeoutMs);
+			this.#pending.push(waiter);
 		});
 	}
 
@@ -1736,6 +1810,7 @@ export class PlanetTransport implements CallTransport {
 
 	async #sendSetup(opts: { to: string }): Promise<void> {
 		if (!this.#route || !this.#local) throw new Error("connect first");
+		if (this.#incoming) throw new Error("callee cannot send SETUP");
 		this.#targetMid = opts.to;
 		const cid = this.#callUuid!;
 		const localMediaOffer = this.#opts.setupOffer
@@ -1764,7 +1839,7 @@ export class PlanetTransport implements CallTransport {
 					cid,
 				),
 			fakeCall: false,
-			svcKey: this.#opts.serviceKey ?? "freecall.audio",
+			svcKey: this.#opts.serviceKey ?? AUDIO_SERVICE_KEY,
 			netType: 1,
 			stid: this.#route.stid,
 			features: this.#opts.features ?? defaultSetupFeatures(),
@@ -1782,6 +1857,231 @@ export class PlanetTransport implements CallTransport {
 			{ bootstrap: true, msgId: CASSINI_MSG_ID_SETUP_REQ },
 		);
 		this.#setupSent = true;
+	}
+
+	#assertIncomingActive(): void {
+		this.#incoming?.signal?.throwIfAborted();
+		if (this.#endReason || this.#closed) {
+			throw callEndedError(this.#endReason ?? { by: "local" });
+		}
+	}
+
+	#matchesIncoming(msg: ReturnType<typeof decodePlanetMsg>): boolean {
+		const state = this.#incoming!;
+		const h = msg.hdr, channel = msg.cc?.hdr ?? msg.mc?.hdr;
+		const same = (a?: Uint8Array, b?: Uint8Array) =>
+			!!a && !!b &&
+			a.length === b.length && a.every((v, i) => v === b[i]);
+		if (
+			!h || !channel || channel.cid !== this.#callUuid ||
+			h.rmtNonce !== this.#locNonce
+		) return false;
+		if (msg.cc && channel.dstChanId !== this.#srcChanId) return false;
+		if (
+			msg.mc &&
+			(!this.#remoteMediaChanId ||
+				channel.dstChanId !== this.#localMediaChanId ||
+				channel.srcChanId !== this.#remoteMediaChanId)
+		) return false;
+		if (
+			state.phase !== "verifying" &&
+			(!same(h.sessId, this.#sessId) || h.locNonce !== this.#rmtNonce ||
+				(msg.cc && channel.srcChanId !== this.#remoteCcChanId))
+		) return false;
+		if (
+			msg.cc?.bodyTag === CC_MSG.VERIFY_RSP ||
+			msg.cc?.bodyTag === CC_MSG.CONN_RSP
+		) {
+			const expected = state.expected;
+			if (
+				!expected || !same(h.tranId, expected.tranId) ||
+				h.tranSeq !== expected.tranSeq
+			) return false;
+			if (state.phase === "verifying") {
+				return msg.cc.bodyTag === CC_MSG.VERIFY_RSP && h.msgId === 0x2242 &&
+					h.sessId?.length === 16 && (channel.srcChanId ?? 0n) > 0n &&
+					(h.locNonce ?? 0n) > 0n;
+			}
+			return state.phase === "answering" &&
+				msg.cc.bodyTag === CC_MSG.CONN_RSP &&
+				(h.msgId === 0x2344 || h.msgId === 0x2244);
+		}
+		return state.phase !== "verifying" && h.tranId?.length === 16;
+	}
+
+	/** Verify an explicitly admitted incoming audio operation without answering it. */
+	async verifyIncomingDetailed(
+		call: IncomingAudioCall,
+		identity: PlanetIncomingIdentity,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (this.#incoming || this.#setupSent) {
+			throw new Error("incoming state already started");
+		}
+		this.#assertIncomingActive();
+		signal?.throwIfAborted();
+		if (
+			!this.#route || call.localMid !== this.#opts.localMid ||
+			call.callerMid !== this.#route.toMid ||
+			call.route.fromToken !== this.#route.fromToken ||
+			call.route.fromZone !== this.#route.iZone ||
+			call.route.toZone !== this.#route.rZone ||
+			!call.callId || call.credential.length !== 32 ||
+			!tagEquals(
+				call.credential,
+				defaultSetupCredential(
+					this.#route,
+					call.callerMid,
+					call.localMid,
+					call.callId,
+				),
+			)
+		) throw new Error("invalid incoming binding");
+		if (
+			!/^[A-Za-z0-9+/]{43}=$/.test(identity.deviceId) ||
+			Buffer.from(identity.deviceId, "base64").toString("base64") !==
+				identity.deviceId ||
+			![
+				identity.userAgent?.osName,
+				identity.userAgent?.osVersion,
+				identity.userAgent?.deviceName,
+			].every((v) =>
+				typeof v === "string" && v.length > 0 && v.length <= 256 &&
+				!/[\x00-\x1f\x7f]/.test(v)
+			)
+		) throw new Error("incoming identity required");
+		this.#callUuid = call.callId;
+		this.#targetMid = call.callerMid;
+		this.#localMediaChanId = BigInt(randomNativeLargeId());
+		if (this.#localMediaChanId === this.#srcChanId) this.#localMediaChanId++;
+		this.#incoming = {
+			phase: "verifying",
+			signal,
+			ua: packPlanetUserAgent(identity.userAgent),
+		};
+		this.#incomingAbort = () => {
+			void this.close().catch(() => {});
+		};
+		signal?.addEventListener("abort", this.#incomingAbort, { once: true });
+		try {
+			const body = packCcVerifyReq({
+				initiator: call.callerMid,
+				responder: call.localMid,
+				iZone: call.route.fromZone,
+				rZone: call.route.toZone,
+				credential: call.credential,
+				devId: identity.deviceId,
+				svcKey: AUDIO_SERVICE_KEY,
+				ua: this.#incoming.ua,
+			});
+			await this.#sendEnvelope({
+				kind: "cc",
+				data: packPlanetCcMsg({
+					cid: call.callId,
+					srcChanId: this.#srcChanId,
+					dstChanId: 0n,
+				}, wrapCcMsg(CC_MSG.VERIFY_REQ, body)),
+			}, { bootstrap: true, msgId: 0x2142 });
+			const reply = await this.#waitForCc(
+				CC_MSG.VERIFY_RSP,
+				this.#opts.timeoutMs ?? 10000,
+			);
+			this.#assertIncomingActive();
+			const verified = decodeCcVerifyRsp(reply.message.cc!.bodyBytes!);
+			if (verified.result !== 0 || verified.relCode) {
+				throw new Error("incoming VERIFY rejected");
+			}
+			const peer = tryDecodeNativeSetupOffer(verified.offer);
+			if (
+				peer?.mediaPubKey?.length !== 33 || peer.mediaNonce?.length !== 16 ||
+				peer.mediaKeyId === undefined ||
+				!peer.media.some((m) =>
+					m.name === "A" && m.enabled === 1 && m.rtpId === 96
+				) ||
+				peer.media.some((m) => m.name === "V" && m.enabled !== 0)
+			) throw new Error("unsupported incoming media offer");
+			this.#remoteCcChanId = reply.message.cc!.hdr!.srcChanId!;
+			this.#incoming.sessionEndpoint = reply.source;
+			this.#incoming.peer = peer;
+			this.#incoming.phase = "verified";
+			this.#incoming.expected = undefined;
+			this.#setupSent = true;
+		} catch (error) {
+			await this.close();
+			throw error;
+		}
+	}
+
+	/** Send a fresh E2EE audio answer; only a final correlated CONN enables media. */
+	async acceptIncomingDetailed(): Promise<{ mediaReady: true }> {
+		this.#assertIncomingActive();
+		if (this.#incoming?.phase !== "verified") {
+			throw new Error("incoming answer state invalid");
+		}
+		this.#incoming.phase = "answering";
+		this.#localMediaOffer = defaultLocalMediaOffer();
+		this.#localMediaOffer.offer = packNativeAnswer(
+			this.#localMediaOffer.material,
+		);
+		try {
+			const body = packCcConnReq({
+				answer: this.#localMediaOffer.offer,
+				mChanId: this.#localMediaChanId,
+				netType: 1,
+				unavailToSec: 120,
+				oCapas: [],
+				features: defaultSetupFeatures(),
+				ua: this.#incoming.ua,
+				reqRec: false,
+			});
+			await this.#sendEnvelope({
+				kind: "cc",
+				data: packPlanetCcMsg({
+					cid: this.#callUuid!,
+					srcChanId: this.#srcChanId,
+					dstChanId: this.#remoteCcChanId,
+				}, wrapCcMsg(CC_MSG.CONN_REQ, body)),
+			}, { msgId: 0x2144 });
+			const deadline = Date.now() + (this.#opts.timeoutMs ?? 10000);
+			let response: CcConnRsp | undefined;
+			while (Date.now() < deadline) {
+				const reply = await this.#waitForCc(
+					CC_MSG.CONN_RSP,
+					Math.max(1, deadline - Date.now()),
+				);
+				this.#assertIncomingActive();
+				response = decodeCcConnRsp(reply.message.cc!.bodyBytes!);
+				if (
+					reply.message.hdr?.msgId === 0x2244 && response.result !== undefined
+				) break;
+				response = undefined;
+			}
+			if (!response) throw new Error("PLANET reply timeout");
+			if (response.result !== 0 || response.relCode || !response.mChanId) {
+				throw new Error("incoming CONN rejected");
+			}
+			this.#remoteMediaChanId = response.mChanId;
+			this.#incoming.expected = undefined;
+			this.#incoming.phase = "answered";
+			// No mAddr: retain the authenticated VERIFY UDP peer. Never use our NAT
+			// address, a route guess, or a later unauthenticated RTP sender.
+			const endpoint = response.mAddr
+				? addrEndpoint(response.mAddr)
+				: this.#incoming.sessionEndpoint;
+			if (!endpoint) throw new Error("incoming media endpoint unresolved");
+			const mediaReady = await this.#configureMedia(
+				this.#incoming.peer,
+				response,
+				{ ...endpoint, source: response.mAddr ? "mAddr" : "session" },
+			);
+			this.#assertIncomingActive();
+			if (!mediaReady) throw new Error("incoming media unavailable");
+			this.#startKeepalive(undefined);
+			return { mediaReady: true };
+		} catch (error) {
+			await this.close();
+			throw error;
+		}
 	}
 
 	async inviteDetailed(opts: { to: string }): Promise<PlanetInviteResult> {
@@ -2100,7 +2400,8 @@ export class PlanetTransport implements CallTransport {
 
 	async #configureMedia(
 		peerOffer: NativeSetupOffer | undefined,
-		connReq: CcConnReq,
+		connReq: CcConnReq | CcConnRsp,
+		incomingEndpoint?: { host: string; port: number; source: string },
 	): Promise<boolean> {
 		if (!peerOffer) return false;
 		const local = this.#localMediaOffer;
@@ -2189,8 +2490,10 @@ export class PlanetTransport implements CallTransport {
 			);
 		}
 		if (this.#mediaKeyCandidates.length === 0) return false;
-		const requestedMode = this.#opts.mediaKeyMode ??
-			(this.#groupJoined ? "audio-secret-sender" : "current");
+		const requestedMode = this.#incoming
+			? "audio-reverse-stage"
+			: this.#opts.mediaKeyMode ??
+				(this.#groupJoined ? "audio-secret-sender" : "current");
 		const initialMode = requestedMode === "auto" ? "current" : requestedMode;
 		const initial = this.#mediaKeyCandidates.find((c) =>
 			c.mode === initialMode
@@ -2223,13 +2526,10 @@ export class PlanetTransport implements CallTransport {
 		const fallbackPort = route.mediaPort ?? route.cscfPort;
 		const mAddrEndpoint = addrEndpoint(connReq.mAddr);
 		const publicEndpoint = addrEndpoint(connReq.uePublicAddr);
-		const endpoint = mAddrEndpoint ?? publicEndpoint ??
+		const endpoint = incomingEndpoint ?? mAddrEndpoint ?? publicEndpoint ??
 			{ host: fallbackHost, port: fallbackPort };
-		const endpointSource = mAddrEndpoint
-			? "mAddr"
-			: publicEndpoint
-			? "uePublicAddr"
-			: "route";
+		const endpointSource = incomingEndpoint?.source ??
+			(mAddrEndpoint ? "mAddr" : publicEndpoint ? "uePublicAddr" : "route");
 		const audio =
 			peerOffer.media.find((m) =>
 				m.name === "A" && m.enabled !== 0 && m.rtpId !== undefined
@@ -2239,11 +2539,19 @@ export class PlanetTransport implements CallTransport {
 		if (this.#groupJoined) {
 			this.#groupRtcpSsrc = GROUP_RTCP_SENDER_SSRC;
 		}
+		// Field 11 is the local answer's send stream, not the peer's field 61.
+		const incomingSsrc = this.#incoming
+			? tryDecodeNativeSetupOffer(local.offer)?.media.find((m) =>
+				m.name === "A"
+			)?.rtpPort
+			: undefined;
+		if (this.#incoming && !incomingSsrc) return false;
 		this.#rtp = {
 			host: endpoint.host,
 			port: endpoint.port,
 			payloadType: audio?.rtpId ?? 96,
-			ssrc: (this.#groupJoined ? this.#groupAudioSsrc : undefined) ??
+			ssrc: incomingSsrc ??
+				(this.#groupJoined ? this.#groupAudioSsrc : undefined) ??
 				audio?.rtcpId ?? audio?.rtpPort ?? randomU32(),
 			seq: randomIntInclusive(0, 0xffff),
 			timestamp: 0,
@@ -2601,6 +2909,10 @@ export class PlanetTransport implements CallTransport {
 
 	async #closeOnce(): Promise<void> {
 		const remoteReleased = this.#endReason?.by === "remote";
+		if (this.#incomingAbort) {
+			this.#incoming?.signal?.removeEventListener("abort", this.#incomingAbort);
+			this.#incomingAbort = undefined;
+		}
 		this.#end({ by: "local" });
 		try {
 			if (
@@ -2616,8 +2928,8 @@ export class PlanetTransport implements CallTransport {
 						roomDestroy: false,
 					})
 					: packCcRelReq({
-						relCode: 2,
-						releaser: "initiator",
+						relCode: this.#incoming ? 1 : 2,
+						releaser: this.#incoming ? "responder" : "initiator",
 						commMediaFlags: 1,
 					});
 				const ccBody = wrapCcMsg(CC_MSG.REL_REQ, relBody);

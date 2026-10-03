@@ -333,6 +333,20 @@ function packDataOffer(codec: Uint8Array, path: Uint8Array): Uint8Array {
 export function packNativeSetupOffer(
 	material: PlanetSetupOfferMaterial,
 ): Uint8Array {
+	return packNativeOneToOneOffer(material, false);
+}
+
+/** Callee audio answer: local stream IDs, disabled video, E2EE only. */
+export function packNativeAnswer(
+	material: PlanetSetupOfferMaterial,
+): Uint8Array {
+	return packNativeOneToOneOffer(material, true);
+}
+
+function packNativeOneToOneOffer(
+	material: PlanetSetupOfferMaterial,
+	answer: boolean,
+): Uint8Array {
 	if (material.mediaPubKey.length !== 33) {
 		throw new Error("packNativeSetupOffer: mediaPubKey must be 33 bytes");
 	}
@@ -342,28 +356,47 @@ export function packNativeSetupOffer(
 	if (material.mediaSecret.length !== 30) {
 		throw new Error("packNativeSetupOffer: mediaSecret must be 30 bytes");
 	}
-	const audioPath = packOfferPath(96, 101, 201);
-	const videoPath = packOfferPath(97, 111, 211);
-	const dataPath = packOfferPath(98, 121, 221);
+	const delta = answer ? 1 : 0;
+	const audioPath = packOfferPath(
+		96,
+		101 + delta,
+		201 + delta,
+		6801 + delta,
+		13601 + delta,
+	);
+	const videoPath = packOfferPath(
+		97,
+		111 + delta,
+		211 + delta,
+		6801 + delta,
+		13601 + delta,
+	);
+	const dataPath = packOfferPath(
+		98,
+		121 + delta,
+		221 + delta,
+		6801 + delta,
+		13601 + delta,
+	);
 	const audio = packAudioVideoOffer(
 		"A",
 		packOfferCodec("A", { enabled: 1, bitrate: 32, kind: 1 }),
 		audioPath,
-		101,
-		201,
+		101 + delta,
+		201 + delta,
 	);
 	const video = packAudioVideoOffer(
 		"V",
 		packOfferCodec("V", {
 			enabled: 0,
 			bitrate: 800,
-			fps: 24,
-			profile: 2,
+			fps: answer ? 10 : 24,
+			profile: answer ? 1 : 2,
 			kind: 2,
 		}),
 		videoPath,
-		111,
-		211,
+		111 + delta,
+		211 + delta,
 	);
 	const data = packDataOffer(
 		packOfferCodec("D", { enabled: 1, bitrate: 2000, kind: 6 }),
@@ -391,9 +424,53 @@ export function packNativeSetupOffer(
 	emitMessage(out, 1, video);
 	emitMessage(out, 1, data);
 	emitMessage(out, 2, finalize(secA));
-	emitMessage(out, 2, finalize(secB));
+	if (!answer) emitMessage(out, 2, finalize(secB));
 	emitMessage(out, 3, finalize(version));
 	return finalize(out);
+}
+
+/** VERIFY uses a different field layout from SETUP. */
+export interface CcVerifyReq {
+	initiator: string;
+	responder: string;
+	iZone: string;
+	rZone: string;
+	ua: Uint8Array;
+	devId: string;
+	credential: Uint8Array;
+	svcKey: string;
+}
+
+export function packCcVerifyReq(r: CcVerifyReq): Uint8Array {
+	const b: Buf = { bytes: [] };
+	emitString(b, 1, r.initiator);
+	emitString(b, 2, r.responder);
+	emitString(b, 3, r.iZone);
+	emitString(b, 4, r.rZone);
+	emitMessage(b, 5, r.ua);
+	emitString(b, 6, r.devId);
+	emitEnum(b, 7, 1);
+	for (const c of [1, 2, 3, 6, 7]) emitEnum(b, 8, c);
+	emitBytes(b, 9, r.credential);
+	emitString(b, 10, r.svcKey);
+	emitEnum(b, 12, 1);
+	emitBool(b, 105, false);
+	return finalize(b);
+}
+
+export interface CcVerifyRsp {
+	result?: number;
+	relCode?: number;
+	offer?: Uint8Array;
+}
+
+export function decodeCcVerifyRsp(bytes: Uint8Array): CcVerifyRsp {
+	const fields = decodeFields(bytes);
+	return {
+		result: asNumberField(fields, 1),
+		relCode: asNumberField(fields, 2),
+		offer: asBytesField(fields, 6),
+	};
 }
 
 export interface PlanetGroupParticipateOfferMaterial {
