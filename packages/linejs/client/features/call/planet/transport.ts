@@ -1595,6 +1595,12 @@ export class PlanetTransport implements CallTransport {
 			replyTo?: DecodedPlanetMsgHdr;
 		} = {},
 	): Promise<void> {
+		if (
+			this.#endReason && opts.msgId !== CASSINI_MSG_ID_REL_REQ &&
+			opts.msgId !== ccMsgId(CC_MSG.REL_RSP)
+		) {
+			throw callEndedError(this.#endReason);
+		}
 		const hdr = "replyTo" in opts
 			? this.#planetReplyHdr(opts.msgId ?? this.#msgIdCounter++, opts.replyTo)
 			: this.#planetHdr(opts.msgId);

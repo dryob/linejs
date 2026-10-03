@@ -787,6 +787,7 @@ async function exerciseMediaCall(remoteRelease: boolean, ringing = false) {
 				assertEquals(rsp.hdr?.tranId, new Uint8Array(16).fill(0x45 + i));
 				assertEquals(rsp.hdr?.sessId, sessId);
 				assertEquals(rsp.cc?.hdr?.cid, cid);
+				assertEquals(rsp.cc?.hdr?.srcChanId, 0x2002n);
 				assertEquals(rsp.cc?.hdr?.dstChanId, 0x1001n);
 				assertEquals(rsp.cc?.bodyBytes, new Uint8Array([8, 0]));
 			}
@@ -814,6 +815,11 @@ async function exerciseMediaCall(remoteRelease: boolean, ringing = false) {
 			1,
 		);
 		assertEquals(await transport.ended, { by: "local" });
+		await assertRejects(
+			() => transport.send(opus),
+			Error,
+			"PlanetTransport closed",
+		);
 	} finally {
 		if (!transportClosed) await transport.close();
 		await new Promise<void>((resolve) => server.close(() => resolve()));
