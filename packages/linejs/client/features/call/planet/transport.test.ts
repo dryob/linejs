@@ -1,4 +1,4 @@
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { Buffer } from "node:buffer";
 import { createSocket, type RemoteInfo, type Socket } from "node:dgram";
 import {
@@ -23,6 +23,7 @@ import {
 	MC_MSG,
 	packCcConnReq,
 	packCcInfoReq,
+	packCcRelReq,
 	packCcSetupRsp,
 	packMcDataReq,
 	packNativeSetupOffer,
@@ -34,7 +35,13 @@ import {
 	wrapMcMsg,
 } from "./schema.ts";
 import { PlanetTransport } from "./transport.ts";
-import { deriveSrtpContext, parseRtp, srtpDecrypt } from "../srtp.ts";
+import {
+	buildRtp,
+	deriveSrtpContext,
+	parseRtp,
+	srtpDecrypt,
+	srtpEncrypt,
+} from "../srtp.ts";
 
 type CallRouteLike = Parameters<PlanetTransport["connect"]>[0]["route"];
 
@@ -353,7 +360,7 @@ Deno.test("PlanetTransport retains generated media offer material for SRTP setup
 	assertEquals(media.offer.length, 311);
 });
 
-Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", async () => {
+async function exerciseMediaCall(remoteRelease: boolean, ringing = false) {
 	const routePeer = generateEphemeralKeypair();
 	const server = await bindUdpServer();
 	const mediaServer = await bindUdpServer();
@@ -445,6 +452,8 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 	let setupHandled = false;
 	let clientRinfo: RemoteInfo | undefined;
 	let serverRecvKeys: TransportKeys | undefined;
+	let serverSendKeys: TransportKeys | undefined;
+	const outbound: ReturnType<typeof decodePlanetMsg>[] = [];
 	let serverMessages = 0;
 	let serverError: unknown;
 	let connReqWireForRetry: Uint8Array | undefined;
@@ -453,6 +462,10 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 	let resolveMedia!: (packet: Uint8Array) => void;
 	let resolvePinholeReport!: () => void;
 	let resolveSecondConnRsp!: () => void;
+	let resolveRelRsps!: () => void;
+	const relRspsReceived = new Promise<void>((resolve) => {
+		resolveRelRsps = resolve;
+	});
 	let resolveInfoReq!: (bodyTag: number) => void;
 	let resolveInfoRsp!: (bodyTag: number) => void;
 	let resolveMcDataRsp!: (
@@ -509,6 +522,10 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 					return;
 				}
 				const msg = decodePlanetMsg(plain);
+				outbound.push(msg);
+				if (
+					outbound.filter((m) => m.cc?.bodyTag === CC_MSG.REL_RSP).length === 2
+				) resolveRelRsps();
 				if (msg.cc?.bodyTag === CC_MSG.CONN_RSP) {
 					connRspCount++;
 					if (connRspCount >= 2) resolveSecondConnRsp();
@@ -551,6 +568,7 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 				sendLabel: replyLabel,
 				recvLabel: replyLabel,
 			}).send;
+			serverSendKeys = serverKeys;
 			serverRecvKeys = deriveCallKeys({
 				mpkey: clientPub,
 				local: routePeer,
@@ -576,11 +594,12 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 			const mcDataReqWire = buildServerWire(serverKeys, mcDataReqPlain, 0x5104);
 			void sendUdp(server, setupRspWire, rinfo).then(() =>
 				new Promise((resolve) => setTimeout(resolve, 5))
-			).then(() => sendUdp(server, connReqWire, rinfo)).then(() =>
-				new Promise((resolve) => setTimeout(resolve, 5))
-			).then(() => sendUdp(server, infoReqWire, rinfo)).then(() =>
-				new Promise((resolve) => setTimeout(resolve, 5))
-			).then(() => sendUdp(server, mcDataReqWire, rinfo));
+			).then(() => ringing ? undefined : sendUdp(server, connReqWire, rinfo))
+				.then(() => new Promise((resolve) => setTimeout(resolve, 5))).then(() =>
+					ringing ? undefined : sendUdp(server, infoReqWire, rinfo)
+				).then(() => new Promise((resolve) => setTimeout(resolve, 5))).then(
+					() => ringing ? undefined : sendUdp(server, mcDataReqWire, rinfo),
+				);
 		} catch (e) {
 			serverError = e;
 		}
@@ -601,6 +620,42 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 			},
 		);
 		assertEquals(invite.setupRsp?.result, 0);
+		if (ringing) {
+			assert(serverSendKeys);
+			assert(clientRinfo);
+			const answer = assertRejects(
+				() => transport.waitForAnswerDetailed({ timeoutMs: 5000 }),
+				Error,
+				"released by remote",
+			);
+			const release = buildControlPlain({
+				bodyTag: CC_MSG.REL_REQ,
+				bodyBytes: packCcRelReq({ relCode: 3, releaser: "responder" }),
+				msgId: 0x2145,
+				sessId,
+				locNonce: 0x123456n,
+				cid,
+				srcChanId: 0x1001n,
+			});
+			await sendUdp(
+				server,
+				buildServerWire(serverSendKeys, release, 0x6101),
+				clientRinfo,
+			);
+			await withTimeout(answer, 300, "ringing release");
+			assertEquals(await transport.ended, {
+				by: "remote",
+				relCode: 3,
+				releaser: "responder",
+			});
+			await transport.close();
+			transportClosed = true;
+			assertEquals(
+				outbound.filter((m) => m.cc?.bodyTag === CC_MSG.REL_REQ).length,
+				0,
+			);
+			return;
+		}
 		const answer = await transport.waitForAnswerDetailed({ timeoutMs: 1000 });
 		assert(answer.mediaReady);
 		assertEquals(answer.connRspSent, true);
@@ -619,6 +674,16 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 		assert(connReqWireForRetry);
 		await sendUdp(server, connReqWireForRetry, clientRinfo);
 		await withTimeout(secondConnRsp, 1000, "duplicate_conn_rsp");
+		if (!remoteRelease) {
+			const req = decodePlanetMsg(connReqPlain);
+			for (
+				const rsp of outbound.filter((m) => m.cc?.bodyTag === CC_MSG.CONN_RSP)
+			) {
+				assertEquals(rsp.hdr?.tranId, req.hdr?.tranId);
+				assertEquals(rsp.hdr?.tranSeq, req.hdr?.tranSeq);
+				assertEquals(rsp.hdr?.sessId, req.hdr?.sessId);
+			}
+		}
 		await sendUdp(
 			mediaServer,
 			new Uint8Array([0x80, 0x60, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]),
@@ -647,15 +712,246 @@ Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", 
 		const receivedWire = await withTimeout(mediaWire, 1000, "media");
 		const rtp = await srtpDecrypt(peerRecv, receivedWire);
 		assertEquals(parseRtp(rtp).payload, opus);
+		if (remoteRelease) {
+			assert(serverSendKeys);
+			const frames = transport.receive()[Symbol.asyncIterator]();
+			const firstFrame = frames.next();
+			const peerSend = await deriveSrtpContext(peerKeys.sendKeying);
+			await sendUdp(
+				mediaServer,
+				await srtpEncrypt(
+					peerSend,
+					buildRtp({
+						payloadType: 96,
+						seq: 10,
+						timestamp: 1920,
+						ssrc: 22,
+						payload: opus,
+					}),
+				),
+				clientRinfo,
+			);
+			assertEquals(
+				(await withTimeout(firstFrame, 300, "received audio")).value,
+				opus,
+			);
+			const pendingFrame = frames.next();
+			await transport.waitForAnswerDetailed({
+				autoConnRsp: false,
+				timeoutMs: 1000,
+			});
+			const pendingAnswer = assertRejects(
+				() => transport.waitForAnswerDetailed({ timeoutMs: 1000 }),
+				Error,
+				"released by remote",
+			);
+			void pendingAnswer.catch(() => {});
+			for (const msgId of [0x2145, 0x2146]) {
+				const release = buildControlPlain({
+					bodyTag: CC_MSG.REL_REQ,
+					bodyBytes: packCcRelReq({ relCode: 1, releaser: "responder" }),
+					msgId,
+					sessId,
+					locNonce: 0x123456n,
+					cid,
+					srcChanId: 0x1001n,
+					dstChanId: 0x2002n,
+				});
+				await sendUdp(
+					server,
+					buildServerWire(serverSendKeys, release, msgId),
+					clientRinfo,
+				);
+			}
+			assertEquals(await withTimeout(pendingFrame, 300, "released receive"), {
+				done: true,
+				value: undefined,
+			});
+			await pendingAnswer;
+			await assertRejects(
+				() => transport.send(opus),
+				Error,
+				"released by remote",
+			);
+			assertEquals(await transport.ended, {
+				by: "remote",
+				relCode: 1,
+				releaser: "responder",
+			});
+			// Wait for the duplicate reply before closing the UDP socket.
+			await withTimeout(relRspsReceived, 300, "duplicate release reply");
+			const replies = outbound.filter((m) => m.cc?.bodyTag === CC_MSG.REL_RSP);
+			for (const [i, rsp] of replies.entries()) {
+				assertEquals(rsp.hdr?.msgId, 0x2245);
+				assertEquals(rsp.hdr?.tranSeq, 0x2145 + i);
+				assertEquals(rsp.hdr?.tranId, new Uint8Array(16).fill(0x45 + i));
+				assertEquals(rsp.hdr?.sessId, sessId);
+				assertEquals(rsp.cc?.hdr?.cid, cid);
+				assertEquals(rsp.cc?.hdr?.dstChanId, 0x1001n);
+				assertEquals(rsp.cc?.bodyBytes, new Uint8Array([8, 0]));
+			}
+			const count = outbound.length;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			assertEquals(outbound.length, count, "keepalive stops on remote release");
+		}
+		await Promise.all([transport.close(), transport.close()]);
 		await transport.close();
 		transportClosed = true;
+		if (remoteRelease) {
+			assertEquals(
+				outbound.filter((m) => m.cc?.bodyTag === CC_MSG.REL_REQ).length,
+				0,
+			);
+			assertEquals(transport.endReason?.by, "remote");
+			return;
+		}
 		assertEquals(await withTimeout(relReq, 1000, "rel_req"), {
 			bodyTag: CC_MSG.REL_REQ,
 			dstChanId: String(0x1001n),
 		});
+		assertEquals(
+			outbound.filter((m) => m.cc?.bodyTag === CC_MSG.REL_REQ).length,
+			1,
+		);
+		assertEquals(await transport.ended, { by: "local" });
 	} finally {
 		if (!transportClosed) await transport.close();
 		await new Promise<void>((resolve) => server.close(() => resolve()));
 		await new Promise<void>((resolve) => mediaServer.close(() => resolve()));
 	}
+}
+
+Deno.test("PlanetTransport learns RTP source and sends decryptable SRTP media", () =>
+	exerciseMediaCall(false));
+Deno.test("PlanetTransport remote release ends media and waiters and replies to duplicates", () =>
+	exerciseMediaCall(true));
+
+Deno.test("PlanetTransport remote release rejects a pending ringing answer", () =>
+	exerciseMediaCall(true, true));
+
+Deno.test("PlanetTransport replies preserve each request transaction across interleaved sessions", async () => {
+	const peer = generateEphemeralKeypair();
+	const seed = new Uint8Array(16).fill(0x32);
+	const sessId = new Uint8Array(16).fill(0x51);
+	const otherSession = new Uint8Array(16).fill(0x52);
+	const common = {
+		sessId,
+		locNonce: 123n,
+		cid: "synthetic-call",
+		srcChanId: 11n,
+		dstChanId: 22n,
+	};
+	const requests = [
+		buildControlPlain({
+			...common,
+			bodyTag: CC_MSG.CONN_REQ,
+			bodyBytes: packCcConnReq({
+				netType: 1,
+				unavailToSec: 120,
+				oCapas: [],
+				features: [],
+			}),
+			msgId: 2,
+		}),
+		buildMediaControlPlain({
+			...common,
+			sessId: otherSession,
+			bodyTag: MC_MSG.DATA_REQ,
+			bodyBytes: packMcDataReq({ dispatchId: 2, data: new Uint8Array([0]) }),
+			msgId: 3,
+		}),
+		buildControlPlain({
+			...common,
+			bodyTag: CC_MSG.INFO_REQ,
+			bodyBytes: packCcInfoReq({
+				bodyType: "profile",
+				body: new Uint8Array([1]),
+				targets: [],
+				tgtUe: [],
+			}),
+			msgId: 4,
+		}),
+		buildMediaControlPlain({
+			...common,
+			sessId: otherSession,
+			bodyTag: MC_MSG.JOIN_REQ,
+			bodyBytes: new Uint8Array([8, 0]),
+			msgId: 5,
+		}),
+		buildMediaControlPlain({
+			...common,
+			bodyTag: MC_MSG.CHANGE_REQ,
+			bodyBytes: new Uint8Array([8, 0]),
+			msgId: 6,
+		}),
+	];
+	const outbound: ReturnType<typeof decodePlanetMsg>[] = [];
+	let keys: TransportKeys;
+	let seq = 1;
+	let probe = 0;
+	const transport = new PlanetTransport({
+		localMid: "u-local",
+		timeoutMs: 500,
+		wireSend(packet, endpoint) {
+			if (endpoint.bootstrap) {
+				outbound.push(decodePlanetMsg(endpoint.plaintext));
+				keys = deriveCallKeys({
+					mpkey: extractBootstrapClientPub(packet),
+					local: peer,
+					bootstrapSeed: seed,
+					sendLabel: 7,
+					recvLabel: 7,
+				}).send;
+				return buildServerWire(
+					keys,
+					buildControlPlain({
+						...common,
+						bodyTag: CC_MSG.SETUP_RSP,
+						bodyBytes: packCcSetupRsp({ result: 0 }),
+						msgId: 1,
+					}),
+					seq++,
+					{ bootstrap: { seed, label: 7, pub: peer.publicKey } },
+				);
+			}
+			if (endpoint.plainLen === 519 || endpoint.plainLen === 10) {
+				const request = requests[probe++];
+				return request ? buildServerWire(keys, request, seq++) : undefined;
+			}
+			const msg = decodePlanetMsg(endpoint.plaintext);
+			outbound.push(msg);
+		},
+	});
+	try {
+		await transport.connect({ route: makeRoute(peer) });
+		await transport.inviteDetailed({ to: "u-peer" });
+		await transport.waitForAnswerDetailed();
+	} finally {
+		await transport.close();
+	}
+	const expectedIds = [0x2244, 0x3289, 0x2247, 0x3285, 0x3286];
+	const localNonce = outbound[0].hdr?.locNonce;
+	for (const [i, plain] of requests.entries()) {
+		const req = decodePlanetMsg(plain);
+		const replies = outbound.filter((m) => m.hdr?.msgId === expectedIds[i]);
+		assertEquals(replies.length, 1);
+		for (const rsp of replies) {
+			assertEquals(rsp.hdr?.tranId, req.hdr?.tranId);
+			assertEquals(rsp.hdr?.tranSeq, req.hdr?.tranSeq);
+			assertEquals(rsp.hdr?.sessId, req.hdr?.sessId);
+			assertEquals(rsp.hdr?.locNonce, localNonce);
+			assertEquals(rsp.hdr?.rmtNonce, 123n);
+		}
+	}
+	const fresh = outbound.filter((m) =>
+		!expectedIds.includes(m.hdr?.msgId ?? 0)
+	);
+	assertEquals(
+		fresh.map((m) => (m.hdr?.tranSeq ?? 0) - (fresh[0].hdr?.tranSeq ?? 0)),
+		fresh.map((_, i) => i),
+	);
+	assertEquals(
+		new Set(fresh.map((m) => Array.from(m.hdr?.tranId ?? []).join(","))).size,
+		fresh.length,
+	);
 });

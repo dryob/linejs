@@ -62,6 +62,7 @@ export {
 
 export {
 	type PlanetAnswerResult,
+	type PlanetEndReason,
 	type PlanetIncomingMessage,
 	type PlanetInviteResult,
 	type PlanetLocalMediaOffer,

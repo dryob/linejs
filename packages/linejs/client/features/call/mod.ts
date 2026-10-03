@@ -59,6 +59,7 @@ export {
 	parseChunkHdr as planetParseChunkHdr,
 	parseFrameHeader as planetParseFrameHeader,
 	type PlanetAnswerResult,
+	type PlanetEndReason,
 	type PlanetFixedHdr,
 	type PlanetInviteResult,
 	type PlanetLocalMediaOffer,

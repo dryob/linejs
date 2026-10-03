@@ -1,4 +1,4 @@
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertThrows } from "@std/assert";
 import { opusCodecFactory } from "./opus.ts";
 
 Deno.test("opusCodecFactory: encodes + decodes a 20ms 48kHz mono frame", async () => {
@@ -36,6 +36,22 @@ Deno.test("opusCodecFactory: encodes + decodes a 20ms 48kHz mono frame", async (
 
 	enc.close?.();
 	dec.close?.();
+});
+
+Deno.test("opusCodecFactory rejects an oversized code-2 frame and accepts variable PCM length", async () => {
+	const factory = await opusCodecFactory();
+	const dec = factory.newDecoder({ sampleRate: 48000, channels: 1 });
+	try {
+		// Synthetic structural fixture, not captured speech: 107 declared, 68 remaining.
+		const malformed = new Uint8Array(70);
+		malformed.set([0x7a, 107]);
+		assertThrows(() => dec.decode(malformed), Error, "Invalid packet");
+		const frame = dec.decode(new Uint8Array([0x7a, 0]));
+		assert(frame);
+		assertEquals(frame.samples.length, 1920);
+	} finally {
+		dec.close?.();
+	}
 });
 
 Deno.test("opusCodecFactory.newEncoder.encode returns null on partial frame", async () => {
