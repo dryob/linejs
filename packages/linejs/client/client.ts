@@ -186,7 +186,10 @@ export class Client extends TypedEventEmitter<ClientEvents> {
 								}),
 							);
 						} else if (event.type === "NOTIFIED_RECEIVED_CALL") {
-							this.emit("call:incoming", parseIncomingCall(event));
+							this.emit(
+								"call:incoming",
+								parseIncomingCall(event, this.base.profile?.mid),
+							);
 						} else if (event.type === "CANCEL_CALL") {
 							this.emit("call:cancel", parseCancelCall(event));
 						}

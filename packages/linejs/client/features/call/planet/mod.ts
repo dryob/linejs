@@ -61,7 +61,10 @@ export {
 } from "./cassini.ts";
 
 export {
+	AUDIO_SERVICE_KEY,
 	type PlanetAnswerResult,
+	type PlanetEndReason,
+	type PlanetIncomingIdentity,
 	type PlanetIncomingMessage,
 	type PlanetInviteResult,
 	type PlanetLocalMediaOffer,

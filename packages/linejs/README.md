@@ -82,6 +82,7 @@ MessageType, etc.) are provided.
   - BaseClient - LINE SelfBot API Client
 - call - (@evex/linejs/call)
   - Call control-plane and media helpers
+  - [Explicit incoming 1:1 audio answering](../../docs/INCOMING_AUDIO.md)
 - thrift - (@evex/linejs/thrift)
   - Thrift - Thrift read/write
 - storage - (@evex/linejs/storage)
